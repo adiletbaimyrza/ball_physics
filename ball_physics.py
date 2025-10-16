@@ -3,6 +3,7 @@ import sys
 import math
 import random
 import pygame.gfxdraw
+from enum import Enum
 
 pygame.init()
 
@@ -19,11 +20,26 @@ C_SCALE = min(WIDTH, HEIGHT) / SIM_MIN_WIDTH
 SIM_WIDTH = WIDTH / C_SCALE
 SIM_HEIGHT = HEIGHT / C_SCALE
 
+
 def inv_cY(y): return (HEIGHT - y) / C_SCALE
 
-# Physics parameters
+
+# Wind Direction Enum ----------------------------------------------
+class WindDirection(Enum):
+    NONE = (0, 0)
+    LEFT = (-1, 0)
+    RIGHT = (1, 0)
+    UP = (0, 1)
+    DOWN = (0, -1)
+
+
+# Physics parameters -----------------------------------------------
 GRAVITY = {'x': 0.0, 'y': -10.0}
 TIME_STEP = 1.0 / 60.0
+AIR_FRICTION = 0.02  # Coefficient of air friction (0 = no friction, 1 = max friction)
+WIND_STRENGTH = 3.0  # Wind force strength
+current_wind = WindDirection.NONE
+
 
 # Multiple balls ---------------------------------------------------
 def make_ball():
@@ -34,27 +50,49 @@ def make_ball():
         'color': [random.randint(100, 255) for _ in range(3)]
     }
 
+
 balls = [make_ball() for _ in range(3)]  # start with 3 balls
-obstacles = []
+drawn_lines = []  # Store drawn pen strokes
+PEN_WIDTH = 15  # Width of the pen stroke
 
 # UI Buttons -------------------------------------------------------
 font = pygame.font.SysFont(None, 24)
+small_font = pygame.font.SysFont(None, 18)
 BUTTON_WIDTH, BUTTON_HEIGHT = 100, 40
+SMALL_BUTTON_WIDTH = 60
 
-def draw_button(x, y, text, active):
+
+def draw_button(x, y, w, h, text, active, text_color=(255, 255, 255)):
     color = (0, 180, 0) if active else (180, 0, 0)
-    pygame.draw.rect(screen, color, (x, y, BUTTON_WIDTH, BUTTON_HEIGHT), border_radius=8)
-    txt = font.render(text, True, (255, 255, 255))
-    screen.blit(txt, (x + (BUTTON_WIDTH - txt.get_width()) // 2,
-                      y + (BUTTON_HEIGHT - txt.get_height()) // 2))
+    pygame.draw.rect(screen, color, (x, y, w, h), border_radius=8)
+    txt = font.render(text, True, text_color)
+    screen.blit(txt, (x + (w - txt.get_width()) // 2,
+                      y + (h - txt.get_height()) // 2))
+
+
+def draw_wind_button(x, y, text, is_active):
+    color = (50, 150, 200) if is_active else (120, 120, 120)
+    pygame.draw.rect(screen, color, (x, y, SMALL_BUTTON_WIDTH, 30), border_radius=5)
+    txt = small_font.render(text, True, (255, 255, 255))
+    screen.blit(txt, (x + (SMALL_BUTTON_WIDTH - txt.get_width()) // 2,
+                      y + (30 - txt.get_height()) // 2))
+
 
 start_button_rect = pygame.Rect(20, 20, BUTTON_WIDTH, BUTTON_HEIGHT)
 pause_button_rect = pygame.Rect(140, 20, BUTTON_WIDTH, BUTTON_HEIGHT)
 add_ball_button_rect = pygame.Rect(260, 20, BUTTON_WIDTH + 20, BUTTON_HEIGHT)
 
+# Wind control buttons
+wind_none_rect = pygame.Rect(20, 80, SMALL_BUTTON_WIDTH, 30)
+wind_left_rect = pygame.Rect(20, 120, SMALL_BUTTON_WIDTH, 30)
+wind_right_rect = pygame.Rect(90, 120, SMALL_BUTTON_WIDTH, 30)
+wind_up_rect = pygame.Rect(90, 80, SMALL_BUTTON_WIDTH, 30)
+wind_down_rect = pygame.Rect(90, 160, SMALL_BUTTON_WIDTH, 30)
+
 running_sim = False
 drawing = False
-draw_start = None
+current_stroke = []  # Current pen stroke being drawn
+
 
 # Helper ------------------------------------------------------------
 def reflect_velocity(vel, normal):
@@ -62,31 +100,74 @@ def reflect_velocity(vel, normal):
     vel['x'] -= 2 * dot * normal[0]
     vel['y'] -= 2 * dot * normal[1]
 
-# Collision detection -----------------------------------------------
-def check_collision(ball_pos, ball_radius, rect):
-    rect_x = rect.x / C_SCALE
-    rect_y = inv_cY(rect.y + rect.height)
-    rect_w = rect.width / C_SCALE
-    rect_h = rect.height / C_SCALE
 
-    closest_x = max(rect_x, min(ball_pos['x'], rect_x + rect_w))
-    closest_y = max(rect_y, min(ball_pos['y'], rect_y + rect_h))
+# Collision detection with line segments ---------------------------
+def point_to_segment_distance(px, py, x1, y1, x2, y2):
+    """Returns the shortest distance from point (px, py) to line segment (x1,y1)-(x2,y2)"""
+    dx = x2 - x1
+    dy = y2 - y1
+    if dx == 0 and dy == 0:
+        return math.sqrt((px - x1) ** 2 + (py - y1) ** 2), (x1, y1)
 
-    dx = ball_pos['x'] - closest_x
-    dy = ball_pos['y'] - closest_y
-    dist2 = dx * dx + dy * dy
+    t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+    closest_x = x1 + t * dx
+    closest_y = y1 + t * dy
+    return math.sqrt((px - closest_x) ** 2 + (py - closest_y) ** 2), (closest_x, closest_y)
 
-    if dist2 <= ball_radius * ball_radius:
-        dist = math.sqrt(dist2) if dist2 != 0 else 0.0001
-        nx, ny = dx / dist, dy / dist
-        return True, (nx, ny)
+
+def check_line_collision(ball_pos, ball_radius, stroke):
+    """Check collision between ball and a pen stroke"""
+    if len(stroke) < 2:
+        return False, None
+
+    for i in range(len(stroke) - 1):
+        x1, y1 = stroke[i]
+        x2, y2 = stroke[i + 1]
+
+        # Convert to simulation coordinates
+        sx1, sy1 = x1 / C_SCALE, inv_cY(y1)
+        sx2, sy2 = x2 / C_SCALE, inv_cY(y2)
+
+        dist, (cx, cy) = point_to_segment_distance(
+            ball_pos['x'], ball_pos['y'], sx1, sy1, sx2, sy2
+        )
+
+        collision_dist = ball_radius + (PEN_WIDTH / 2) / C_SCALE
+
+        if dist < collision_dist:
+            # Calculate normal
+            dx = ball_pos['x'] - cx
+            dy = ball_pos['y'] - cy
+            d = math.sqrt(dx * dx + dy * dy)
+            if d > 0:
+                return True, (dx / d, dy / d)
+
     return False, None
+
 
 # Simulation --------------------------------------------------------
 def simulate():
+    # Get wind force
+    wind_x, wind_y = current_wind.value
+    wind_force_x = wind_x * WIND_STRENGTH
+    wind_force_y = wind_y * WIND_STRENGTH
+
     for ball in balls:
+        # Apply gravity
         ball['vel']['x'] += GRAVITY['x'] * TIME_STEP
         ball['vel']['y'] += GRAVITY['y'] * TIME_STEP
+
+        # Apply wind force
+        ball['vel']['x'] += wind_force_x * TIME_STEP
+        ball['vel']['y'] += wind_force_y * TIME_STEP
+
+        # Apply air friction (proportional to velocity)
+        friction_x = -AIR_FRICTION * ball['vel']['x']
+        friction_y = -AIR_FRICTION * ball['vel']['y']
+        ball['vel']['x'] += friction_x * TIME_STEP
+        ball['vel']['y'] += friction_y * TIME_STEP
+
+        # Update position
         ball['pos']['x'] += ball['vel']['x'] * TIME_STEP
         ball['pos']['y'] += ball['vel']['y'] * TIME_STEP
 
@@ -101,46 +182,48 @@ def simulate():
             ball['pos']['y'] = ball['radius']
             ball['vel']['y'] = -ball['vel']['y']
 
-        # Obstacle collisions
-        for rect in obstacles:
-            collided, normal = check_collision(ball['pos'], ball['radius'], rect)
+        # Line collisions
+        for stroke in drawn_lines:
+            collided, normal = check_line_collision(ball['pos'], ball['radius'], stroke)
             if collided:
                 reflect_velocity(ball['vel'], normal)
-                ball['pos']['x'] += normal[0] * 0.02
-                ball['pos']['y'] += normal[1] * 0.02
+                ball['pos']['x'] += normal[0] * 0.05
+                ball['pos']['y'] += normal[1] * 0.05
 
-        for i in range(len(balls)):
-            for j in range(i + 1, len(balls)):
-                b1, b2 = balls[i], balls[j]
+    # Ball-to-ball collisions
+    for i in range(len(balls)):
+        for j in range(i + 1, len(balls)):
+            b1, b2 = balls[i], balls[j]
 
-                dx = b2['pos']['x'] - b1['pos']['x']
-                dy = b2['pos']['y'] - b1['pos']['y']
-                dist2 = dx * dx + dy * dy
-                min_dist = b1['radius'] + b2['radius']
+            dx = b2['pos']['x'] - b1['pos']['x']
+            dy = b2['pos']['y'] - b1['pos']['y']
+            dist2 = dx * dx + dy * dy
+            min_dist = b1['radius'] + b2['radius']
 
-                if dist2 < min_dist * min_dist:
-                    dist = math.sqrt(dist2) if dist2 != 0 else 0.0001
-                    nx, ny = dx / dist, dy / dist
+            if dist2 < min_dist * min_dist:
+                dist = math.sqrt(dist2) if dist2 != 0 else 0.0001
+                nx, ny = dx / dist, dy / dist
 
-                    # Separate overlapping balls
-                    overlap = 0.5 * (min_dist - dist)
-                    b1['pos']['x'] -= nx * overlap
-                    b1['pos']['y'] -= ny * overlap
-                    b2['pos']['x'] += nx * overlap
-                    b2['pos']['y'] += ny * overlap
+                # Separate overlapping balls
+                overlap = 0.5 * (min_dist - dist)
+                b1['pos']['x'] -= nx * overlap
+                b1['pos']['y'] -= ny * overlap
+                b2['pos']['x'] += nx * overlap
+                b2['pos']['y'] += ny * overlap
 
-                    # Relative velocity along the normal
-                    dvx = b2['vel']['x'] - b1['vel']['x']
-                    dvy = b2['vel']['y'] - b1['vel']['y']
-                    vn = dvx * nx + dvy * ny
+                # Relative velocity along the normal
+                dvx = b2['vel']['x'] - b1['vel']['x']
+                dvy = b2['vel']['y'] - b1['vel']['y']
+                vn = dvx * nx + dvy * ny
 
-                    if vn < 0:  # only collide if moving toward each other
-                        # Elastic collision (equal mass)
-                        impulse = -2 * vn / 2
-                        b1['vel']['x'] -= impulse * nx
-                        b1['vel']['y'] -= impulse * ny
-                        b2['vel']['x'] += impulse * nx
-                        b2['vel']['y'] += impulse * ny
+                if vn < 0:  # only collide if moving toward each other
+                    # Elastic collision (equal mass)
+                    impulse = -2 * vn / 2
+                    b1['vel']['x'] -= impulse * nx
+                    b1['vel']['y'] -= impulse * ny
+                    b2['vel']['x'] += impulse * nx
+                    b2['vel']['y'] += impulse * ny
+
 
 # Main loop --------------------------------------------------------
 running = True
@@ -156,17 +239,30 @@ while running:
                 running_sim = False
             elif add_ball_button_rect.collidepoint(event.pos):
                 balls.append(make_ball())
+            elif wind_none_rect.collidepoint(event.pos):
+                current_wind = WindDirection.NONE
+            elif wind_left_rect.collidepoint(event.pos):
+                current_wind = WindDirection.LEFT
+            elif wind_right_rect.collidepoint(event.pos):
+                current_wind = WindDirection.RIGHT
+            elif wind_up_rect.collidepoint(event.pos):
+                current_wind = WindDirection.UP
+            elif wind_down_rect.collidepoint(event.pos):
+                current_wind = WindDirection.DOWN
             elif not running_sim:
-                draw_start = event.pos
+                # Start drawing
                 drawing = True
+                current_stroke = [event.pos]
+
+        elif event.type == pygame.MOUSEMOTION and drawing:
+            # Continue drawing
+            current_stroke.append(event.pos)
 
         elif event.type == pygame.MOUSEBUTTONUP and drawing:
-            draw_end = event.pos
-            x1, y1 = draw_start
-            x2, y2 = draw_end
-            rect = pygame.Rect(min(x1, x2), min(y1, y2),
-                               abs(x2 - x1), abs(y2 - y1))
-            obstacles.append(rect)
+            # Finish drawing
+            if len(current_stroke) > 1:
+                drawn_lines.append(current_stroke)
+            current_stroke = []
             drawing = False
 
     if running_sim:
@@ -174,32 +270,50 @@ while running:
 
     # Drawing -------------------------------------------------------
     screen.fill((255, 255, 255))
-    draw_button(start_button_rect.x, start_button_rect.y, "Start", running_sim)
-    draw_button(pause_button_rect.x, pause_button_rect.y, "Pause", not running_sim)
 
-    pygame.draw.rect(screen, (0, 0, 180), add_ball_button_rect, border_radius=8)
-    txt = font.render("Add Ball", True, (255, 255, 255))
-    screen.blit(txt, (add_ball_button_rect.x + (add_ball_button_rect.width - txt.get_width()) // 2,
-                      add_ball_button_rect.y + (add_ball_button_rect.height - txt.get_height()) // 2))
+    # Main control buttons
+    draw_button(start_button_rect.x, start_button_rect.y, BUTTON_WIDTH, BUTTON_HEIGHT,
+                "Start", running_sim)
+    draw_button(pause_button_rect.x, pause_button_rect.y, BUTTON_WIDTH, BUTTON_HEIGHT,
+                "Pause", not running_sim)
+    draw_button(add_ball_button_rect.x, add_ball_button_rect.y, BUTTON_WIDTH + 20, BUTTON_HEIGHT,
+                "Add Ball", False)
 
-    # Obstacles
-    for rect in obstacles:
-        pygame.draw.rect(screen, (0, 0, 0), rect)
+    # Wind control label
+    wind_label = small_font.render("Wind:", True, (0, 0, 0))
+    screen.blit(wind_label, (160, 85))
 
-    # While drawing
-    if drawing:
-        mx, my = pygame.mouse.get_pos()
-        x1, y1 = draw_start
-        temp_rect = pygame.Rect(min(x1, mx), min(y1, my), abs(mx - x1), abs(my - y1))
-        pygame.draw.rect(screen, (150, 150, 150), temp_rect, 2)
+    # Wind direction buttons
+    draw_wind_button(wind_none_rect.x, wind_none_rect.y, "None", current_wind == WindDirection.NONE)
+    draw_wind_button(wind_left_rect.x, wind_left_rect.y, "Left", current_wind == WindDirection.LEFT)
+    draw_wind_button(wind_right_rect.x, wind_right_rect.y, "Right", current_wind == WindDirection.RIGHT)
+    draw_wind_button(wind_up_rect.x, wind_up_rect.y, "Up", current_wind == WindDirection.UP)
+    draw_wind_button(wind_down_rect.x, wind_down_rect.y, "Down", current_wind == WindDirection.DOWN)
+
+    # Draw all completed strokes
+    for stroke in drawn_lines:
+        if len(stroke) > 1:
+            pygame.draw.lines(screen, (0, 0, 0), False, stroke, PEN_WIDTH)
+
+    # Draw current stroke being drawn
+    if drawing and len(current_stroke) > 1:
+        pygame.draw.lines(screen, (100, 100, 100), False, current_stroke, PEN_WIDTH)
 
     # Balls
     for ball in balls:
+        # Use floating point for center position
         px = ball['pos']['x'] * C_SCALE
         py = HEIGHT - ball['pos']['y'] * C_SCALE
-        pr = round(ball['radius'] * C_SCALE)
+        # Calculate radius with ceiling to ensure we always round up
+        pr = math.ceil(ball['radius'] * C_SCALE)
+
+        # Draw a slightly larger filled circle to prevent gaps
         pygame.gfxdraw.filled_circle(screen, int(px), int(py), pr, ball['color'])
+        # Add antialiased edge at the correct radius
         pygame.gfxdraw.aacircle(screen, int(px), int(py), pr, ball['color'])
+        # Draw one pixel larger to fill any gaps
+        if pr > 1:
+            pygame.gfxdraw.aacircle(screen, int(px), int(py), pr - 1, ball['color'])
 
     pygame.display.flip()
     clock.tick(60)
