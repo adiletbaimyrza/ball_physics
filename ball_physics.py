@@ -41,8 +41,16 @@ AIR_FRICTION = 0.98  # Damping coefficient (0-1, where 1 = no friction, 0.98 = 2
 WIND_STRENGTH = 3.0  # Wind force strength
 current_wind = WindDirection.NONE
 
-# Ball Constants (NEW) ---------------------------------------------
-BALL_RADIUS = 0.5
+# Ball Constants (UPDATED with variable Radius) --------------------
+# Mass range
+BALL_MIN_MASS = 1.0
+BALL_MAX_MASS = 5.0
+
+# Radius range (linked to mass for visual size)
+BALL_MIN_RADIUS = 0.3
+BALL_MAX_RADIUS = 0.7
+
+# Position and Velocity bounds
 BALL_MIN_POS = {'x': 0.2, 'y': 0.2}
 BALL_MAX_POS = {'x': 1.0, 'y': 2.0}
 BALL_MIN_VEL = {'x': 6.0, 'y': 10.0}
@@ -51,20 +59,34 @@ BALL_MAX_VEL = {'x': 12.0, 'y': 18.0}
 
 # Multiple balls ---------------------------------------------------
 def make_ball():
-    # Calculate safe spawning bounds, ensuring the ball's center is at least
-    # one radius away from the simulation edges (0 and SIM_WIDTH/HEIGHT).
+    # 1. Generate Mass
+    mass = random.uniform(BALL_MIN_MASS, BALL_MAX_MASS)
+
+    # 2. Calculate Radius (using M proportional to R^3 normalized scaling)
+    # This ensures R_min -> M_min and R_max -> M_max using volumetric relationship
+    mass_range = BALL_MAX_MASS - BALL_MIN_MASS
+    if mass_range > 0:
+        # Normalized mass position (0 to 1)
+        norm_m = (mass - BALL_MIN_MASS) / mass_range
+        # Normalized radius position (R proportional to M^(1/3))
+        norm_r = norm_m ** (1 / 3)
+
+        radius_range = BALL_MAX_RADIUS - BALL_MIN_RADIUS
+        radius = BALL_MIN_RADIUS + norm_r * radius_range
+    else:
+        # Handle case where min and max mass are the same
+        radius = BALL_MIN_RADIUS
+
+    # 3. Calculate safe spawning bounds, ensuring the ball's center is at least
+    # one radius away from the simulation edges.
 
     # X-position bounds
-    x_min_bound = max(BALL_MIN_POS['x'], BALL_RADIUS)
-    x_max_bound = min(BALL_MAX_POS['x'], SIM_WIDTH - BALL_RADIUS)
+    x_min_bound = max(BALL_MIN_POS['x'], radius)
+    x_max_bound = min(BALL_MAX_POS['x'], SIM_WIDTH - radius)
 
     # Y-position bounds
-    y_min_bound = max(BALL_MIN_POS['y'], BALL_RADIUS)
-    y_max_bound = min(BALL_MAX_POS['y'], SIM_HEIGHT - BALL_RADIUS)
-
-    # Note: If x_min_bound > x_max_bound, random.uniform will error.
-    # This design assumes the user-defined min/max positions are safe.
-    # We will use x_min_bound if the calculated range is invalid to prevent crash.
+    y_min_bound = max(BALL_MIN_POS['y'], radius)
+    y_max_bound = min(BALL_MAX_POS['y'], SIM_HEIGHT - radius)
 
     safe_x_start = x_min_bound
     safe_x_end = max(x_min_bound, x_max_bound)
@@ -72,8 +94,13 @@ def make_ball():
     safe_y_start = y_min_bound
     safe_y_end = max(y_min_bound, y_max_bound)
 
+    # If the calculated range is invalid (e.g., SIM_WIDTH too small), ensure start <= end
+    if safe_x_start > safe_x_end: safe_x_end = safe_x_start
+    if safe_y_start > safe_y_end: safe_y_end = safe_y_start
+
     return {
-        'radius': BALL_RADIUS,
+        'radius': radius,  # Dynamic radius
+        'mass': mass,  # Dynamic mass
         'pos': {
             'x': random.uniform(safe_x_start, safe_x_end),
             'y': random.uniform(safe_y_start, safe_y_end)
@@ -90,6 +117,7 @@ def copy_ball(ball):
     """Create a copy of a ball"""
     return {
         'radius': ball['radius'],
+        'mass': ball['mass'],
         'pos': {'x': ball['pos']['x'], 'y': ball['pos']['y']},
         'vel': {'x': ball['vel']['x'], 'y': ball['vel']['y']},
         'color': ball['color'].copy()
@@ -101,7 +129,7 @@ balls_without_friction = [copy_ball(b) for b in balls_with_friction]  # Right sc
 
 drawn_lines_left = []  # Store drawn pen strokes for left screen
 drawn_lines_right = []  # Store drawn pen strokes for right screen
-PEN_WIDTH = 15  # Width of the pen stroke
+PEN_WIDTH = 5  # Width of the pen stroke
 
 # UI Buttons -------------------------------------------------------
 font = pygame.font.SysFont(None, 24)
@@ -216,18 +244,24 @@ def check_line_collision(ball_pos, ball_radius, stroke, screen_offset=0):
 
 # Simulation --------------------------------------------------------
 def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
-    # Get wind force
+    # Get wind force (This is a force F, not an acceleration)
     wind_x, wind_y = current_wind.value
     wind_force_x = wind_x * WIND_STRENGTH
     wind_force_y = wind_y * WIND_STRENGTH
 
     for ball in balls:
         # 1. Apply Forces (Gravity + Wind)
+
+        # Gravity: GRAVITY is defined as acceleration (g), which is mass-independent.
+        # v = u + a*t -> dv = a*dt
         ball['vel']['x'] += GRAVITY['x'] * TIME_STEP
         ball['vel']['y'] += GRAVITY['y'] * TIME_STEP
 
-        ball['vel']['x'] += wind_force_x * TIME_STEP
-        ball['vel']['y'] += wind_force_y * TIME_STEP
+        # Wind: Wind is a force (F). Acceleration is F/m.
+        # dv = (F/m) * dt
+        mass = ball['mass']
+        ball['vel']['x'] += (wind_force_x / mass) * TIME_STEP
+        ball['vel']['y'] += (wind_force_y / mass) * TIME_STEP
 
         # 2. Apply Air Friction (Exponential Damping)
         if apply_friction:
@@ -269,7 +303,7 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
             if collided:
                 reflect_velocity(ball['vel'], normal)  # reflect_velocity now applies COR
 
-    # 6. Ball-to-ball collisions (still assuming equal mass, but added COR)
+    # 6. Ball-to-ball collisions (UPDATED for variable mass)
     COR_BALL = 0.95
 
     for i in range(len(balls)):
@@ -298,13 +332,16 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
                 vn = dvx * nx + dvy * ny
 
                 if vn < 0:  # only collide if moving toward each other
-                    # Calculate impulse (assumes equal mass, applies COR)
-                    j_impulse = -(1 + COR_BALL) * vn / 2
+                    # Calculate impulse for unequal masses (Conservation of Momentum)
+                    # Impulse j = -(1 + COR) * (vn) / (1/m1 + 1/m2)
+                    mass_sum_inv = 1.0 / b1['mass'] + 1.0 / b2['mass']
+                    j_impulse = -(1 + COR_BALL) * vn / mass_sum_inv
 
-                    b1['vel']['x'] -= j_impulse * nx
-                    b1['vel']['y'] -= j_impulse * ny
-                    b2['vel']['x'] += j_impulse * nx
-                    b2['vel']['y'] += j_impulse * ny
+                    # Apply impulse change to velocity: dv = J / m
+                    b1['vel']['x'] -= (j_impulse / b1['mass']) * nx
+                    b1['vel']['y'] -= (j_impulse / b1['mass']) * ny
+                    b2['vel']['x'] += (j_impulse / b2['mass']) * nx
+                    b2['vel']['y'] += (j_impulse / b2['mass']) * ny
 
 
 def draw_balls(balls, screen_offset=0):
@@ -312,6 +349,7 @@ def draw_balls(balls, screen_offset=0):
     for ball in balls:
         px = ball['pos']['x'] * C_SCALE + screen_offset
         py = HEIGHT - ball['pos']['y'] * C_SCALE
+        # Use math.ceil to ensure radius is at least 1 pixel wide
         pr = math.ceil(ball['radius'] * C_SCALE)
 
         # Draw shadow (offset down and right)
