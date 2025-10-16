@@ -37,8 +37,8 @@ class WindDirection(Enum):
 # Physics parameters -----------------------------------------------
 GRAVITY = {'x': 0.0, 'y': -10.0}
 TIME_STEP = 1.0 / 60.0
-AIR_FRICTION = 0.1  # Coefficient of air friction (0 = no friction, 1 = max friction)
-WIND_STRENGTH = 6.0  # Wind force strength
+AIR_FRICTION = 0.02  # Coefficient of air friction (0 = no friction, 1 = max friction)
+WIND_STRENGTH = 3.0  # Wind force strength
 current_wind = WindDirection.NONE
 
 
@@ -95,6 +95,7 @@ def draw_wind_button(x, y, text, is_active):
 start_button_rect = pygame.Rect(20, 20, BUTTON_WIDTH, BUTTON_HEIGHT)
 pause_button_rect = pygame.Rect(140, 20, BUTTON_WIDTH, BUTTON_HEIGHT)
 add_ball_button_rect = pygame.Rect(260, 20, BUTTON_WIDTH + 20, BUTTON_HEIGHT)
+restart_button_rect = pygame.Rect(400, 20, BUTTON_WIDTH, BUTTON_HEIGHT)
 
 # Wind control buttons
 wind_none_rect = pygame.Rect(20, 80, SMALL_BUTTON_WIDTH, 30)
@@ -269,6 +270,14 @@ while running:
                 running_sim = True
             elif pause_button_rect.collidepoint(event.pos):
                 running_sim = False
+            elif restart_button_rect.collidepoint(event.pos):
+                # Restart: clear everything and create new balls
+                running_sim = False
+                balls_with_friction = [make_ball() for _ in range(3)]
+                balls_without_friction = [copy_ball(b) for b in balls_with_friction]
+                drawn_lines_left = []
+                drawn_lines_right = []
+                current_wind = WindDirection.NONE
             elif add_ball_button_rect.collidepoint(event.pos):
                 new_ball = make_ball()
                 balls_with_friction.append(new_ball)
@@ -333,6 +342,8 @@ while running:
                 "Pause", not running_sim)
     draw_button(add_ball_button_rect.x, add_ball_button_rect.y, BUTTON_WIDTH + 20, BUTTON_HEIGHT,
                 "Add Ball", False)
+    draw_button(restart_button_rect.x, restart_button_rect.y, BUTTON_WIDTH, BUTTON_HEIGHT,
+                "Restart", False)
 
     # Wind control label
     wind_label = small_font.render("Wind:", True, (0, 0, 0))
