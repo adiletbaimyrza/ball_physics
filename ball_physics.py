@@ -8,16 +8,17 @@ from enum import Enum
 pygame.init()
 
 # Window setup -----------------------------------------------------
-WIDTH, HEIGHT = 800, 600
+WIDTH, HEIGHT = 1600, 600  # Double width for two screens
+SCREEN_WIDTH = WIDTH // 2  # Each screen is half
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Cannonball with Multiple Balls")
+pygame.display.set_caption("Air Friction Comparison - Left: With Friction | Right: Without Friction")
 
 clock = pygame.time.Clock()
 
 # Simulation setup -------------------------------------------------
 SIM_MIN_WIDTH = 20.0
-C_SCALE = min(WIDTH, HEIGHT) / SIM_MIN_WIDTH
-SIM_WIDTH = WIDTH / C_SCALE
+C_SCALE = min(SCREEN_WIDTH, HEIGHT) / SIM_MIN_WIDTH
+SIM_WIDTH = SCREEN_WIDTH / C_SCALE
 SIM_HEIGHT = HEIGHT / C_SCALE
 
 
@@ -36,8 +37,8 @@ class WindDirection(Enum):
 # Physics parameters -----------------------------------------------
 GRAVITY = {'x': 0.0, 'y': -10.0}
 TIME_STEP = 1.0 / 60.0
-AIR_FRICTION = 0.02  # Coefficient of air friction (0 = no friction, 1 = max friction)
-WIND_STRENGTH = 3.0  # Wind force strength
+AIR_FRICTION = 0.1  # Coefficient of air friction (0 = no friction, 1 = max friction)
+WIND_STRENGTH = 6.0  # Wind force strength
 current_wind = WindDirection.NONE
 
 
@@ -51,8 +52,21 @@ def make_ball():
     }
 
 
-balls = [make_ball() for _ in range(3)]  # start with 3 balls
-drawn_lines = []  # Store drawn pen strokes
+def copy_ball(ball):
+    """Create a copy of a ball"""
+    return {
+        'radius': ball['radius'],
+        'pos': {'x': ball['pos']['x'], 'y': ball['pos']['y']},
+        'vel': {'x': ball['vel']['x'], 'y': ball['vel']['y']},
+        'color': ball['color'].copy()
+    }
+
+
+balls_with_friction = [make_ball() for _ in range(3)]  # Left screen
+balls_without_friction = [copy_ball(b) for b in balls_with_friction]  # Right screen (copies)
+
+drawn_lines_left = []  # Store drawn pen strokes for left screen
+drawn_lines_right = []  # Store drawn pen strokes for right screen
 PEN_WIDTH = 15  # Width of the pen stroke
 
 # UI Buttons -------------------------------------------------------
@@ -90,8 +104,10 @@ wind_up_rect = pygame.Rect(90, 80, SMALL_BUTTON_WIDTH, 30)
 wind_down_rect = pygame.Rect(90, 160, SMALL_BUTTON_WIDTH, 30)
 
 running_sim = False
-drawing = False
-current_stroke = []  # Current pen stroke being drawn
+drawing_left = False
+drawing_right = False
+current_stroke_left = []
+current_stroke_right = []
 
 
 # Helper ------------------------------------------------------------
@@ -115,7 +131,7 @@ def point_to_segment_distance(px, py, x1, y1, x2, y2):
     return math.sqrt((px - closest_x) ** 2 + (py - closest_y) ** 2), (closest_x, closest_y)
 
 
-def check_line_collision(ball_pos, ball_radius, stroke):
+def check_line_collision(ball_pos, ball_radius, stroke, screen_offset=0):
     """Check collision between ball and a pen stroke"""
     if len(stroke) < 2:
         return False, None
@@ -124,9 +140,9 @@ def check_line_collision(ball_pos, ball_radius, stroke):
         x1, y1 = stroke[i]
         x2, y2 = stroke[i + 1]
 
-        # Convert to simulation coordinates
-        sx1, sy1 = x1 / C_SCALE, inv_cY(y1)
-        sx2, sy2 = x2 / C_SCALE, inv_cY(y2)
+        # Convert to simulation coordinates (adjust for screen offset)
+        sx1, sy1 = (x1 - screen_offset) / C_SCALE, inv_cY(y1)
+        sx2, sy2 = (x2 - screen_offset) / C_SCALE, inv_cY(y2)
 
         dist, (cx, cy) = point_to_segment_distance(
             ball_pos['x'], ball_pos['y'], sx1, sy1, sx2, sy2
@@ -146,7 +162,7 @@ def check_line_collision(ball_pos, ball_radius, stroke):
 
 
 # Simulation --------------------------------------------------------
-def simulate():
+def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
     # Get wind force
     wind_x, wind_y = current_wind.value
     wind_force_x = wind_x * WIND_STRENGTH
@@ -161,11 +177,12 @@ def simulate():
         ball['vel']['x'] += wind_force_x * TIME_STEP
         ball['vel']['y'] += wind_force_y * TIME_STEP
 
-        # Apply air friction (proportional to velocity)
-        friction_x = -AIR_FRICTION * ball['vel']['x']
-        friction_y = -AIR_FRICTION * ball['vel']['y']
-        ball['vel']['x'] += friction_x * TIME_STEP
-        ball['vel']['y'] += friction_y * TIME_STEP
+        # Apply air friction (only if apply_friction is True)
+        if apply_friction:
+            friction_x = -AIR_FRICTION * ball['vel']['x']
+            friction_y = -AIR_FRICTION * ball['vel']['y']
+            ball['vel']['x'] += friction_x * TIME_STEP
+            ball['vel']['y'] += friction_y * TIME_STEP
 
         # Update position
         ball['pos']['x'] += ball['vel']['x'] * TIME_STEP
@@ -184,7 +201,7 @@ def simulate():
 
         # Line collisions
         for stroke in drawn_lines:
-            collided, normal = check_line_collision(ball['pos'], ball['radius'], stroke)
+            collided, normal = check_line_collision(ball['pos'], ball['radius'], stroke, screen_offset)
             if collided:
                 reflect_velocity(ball['vel'], normal)
                 ball['pos']['x'] += normal[0] * 0.05
@@ -225,9 +242,24 @@ def simulate():
                     b2['vel']['y'] += impulse * ny
 
 
+def draw_balls(balls, screen_offset=0):
+    """Draw balls with given screen offset"""
+    for ball in balls:
+        px = ball['pos']['x'] * C_SCALE + screen_offset
+        py = HEIGHT - ball['pos']['y'] * C_SCALE
+        pr = math.ceil(ball['radius'] * C_SCALE)
+
+        pygame.gfxdraw.filled_circle(screen, int(px), int(py), pr, ball['color'])
+        pygame.gfxdraw.aacircle(screen, int(px), int(py), pr, ball['color'])
+        if pr > 1:
+            pygame.gfxdraw.aacircle(screen, int(px), int(py), pr - 1, ball['color'])
+
+
 # Main loop --------------------------------------------------------
 running = True
 while running:
+    mouse_pos = pygame.mouse.get_pos()
+
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
@@ -238,7 +270,9 @@ while running:
             elif pause_button_rect.collidepoint(event.pos):
                 running_sim = False
             elif add_ball_button_rect.collidepoint(event.pos):
-                balls.append(make_ball())
+                new_ball = make_ball()
+                balls_with_friction.append(new_ball)
+                balls_without_friction.append(copy_ball(new_ball))
             elif wind_none_rect.collidepoint(event.pos):
                 current_wind = WindDirection.NONE
             elif wind_left_rect.collidepoint(event.pos):
@@ -250,26 +284,47 @@ while running:
             elif wind_down_rect.collidepoint(event.pos):
                 current_wind = WindDirection.DOWN
             elif not running_sim:
-                # Start drawing
-                drawing = True
-                current_stroke = [event.pos]
+                # Start drawing on left or right screen
+                if event.pos[0] < SCREEN_WIDTH:
+                    drawing_left = True
+                    current_stroke_left = [event.pos]
+                else:
+                    drawing_right = True
+                    current_stroke_right = [event.pos]
 
-        elif event.type == pygame.MOUSEMOTION and drawing:
-            # Continue drawing
-            current_stroke.append(event.pos)
+        elif event.type == pygame.MOUSEMOTION:
+            if drawing_left:
+                current_stroke_left.append(event.pos)
+            elif drawing_right:
+                current_stroke_right.append(event.pos)
 
-        elif event.type == pygame.MOUSEBUTTONUP and drawing:
-            # Finish drawing
-            if len(current_stroke) > 1:
-                drawn_lines.append(current_stroke)
-            current_stroke = []
-            drawing = False
+        elif event.type == pygame.MOUSEBUTTONUP:
+            if drawing_left:
+                if len(current_stroke_left) > 1:
+                    drawn_lines_left.append(current_stroke_left)
+                current_stroke_left = []
+                drawing_left = False
+            elif drawing_right:
+                if len(current_stroke_right) > 1:
+                    drawn_lines_right.append(current_stroke_right)
+                current_stroke_right = []
+                drawing_right = False
 
     if running_sim:
-        simulate()
+        simulate_balls(balls_with_friction, drawn_lines_left, apply_friction=True, screen_offset=0)
+        simulate_balls(balls_without_friction, drawn_lines_right, apply_friction=False, screen_offset=SCREEN_WIDTH)
 
     # Drawing -------------------------------------------------------
     screen.fill((255, 255, 255))
+
+    # Draw divider line
+    pygame.draw.line(screen, (0, 0, 0), (SCREEN_WIDTH, 0), (SCREEN_WIDTH, HEIGHT), 3)
+
+    # Labels
+    label_left = font.render("WITH AIR FRICTION", True, (0, 100, 0))
+    label_right = font.render("WITHOUT AIR FRICTION", True, (100, 0, 0))
+    screen.blit(label_left, (SCREEN_WIDTH // 2 - label_left.get_width() // 2, HEIGHT - 30))
+    screen.blit(label_right, (SCREEN_WIDTH + SCREEN_WIDTH // 2 - label_right.get_width() // 2, HEIGHT - 30))
 
     # Main control buttons
     draw_button(start_button_rect.x, start_button_rect.y, BUTTON_WIDTH, BUTTON_HEIGHT,
@@ -290,30 +345,23 @@ while running:
     draw_wind_button(wind_up_rect.x, wind_up_rect.y, "Up", current_wind == WindDirection.UP)
     draw_wind_button(wind_down_rect.x, wind_down_rect.y, "Down", current_wind == WindDirection.DOWN)
 
-    # Draw all completed strokes
-    for stroke in drawn_lines:
+    # Draw left screen strokes
+    for stroke in drawn_lines_left:
         if len(stroke) > 1:
             pygame.draw.lines(screen, (0, 0, 0), False, stroke, PEN_WIDTH)
+    if drawing_left and len(current_stroke_left) > 1:
+        pygame.draw.lines(screen, (100, 100, 100), False, current_stroke_left, PEN_WIDTH)
 
-    # Draw current stroke being drawn
-    if drawing and len(current_stroke) > 1:
-        pygame.draw.lines(screen, (100, 100, 100), False, current_stroke, PEN_WIDTH)
+    # Draw right screen strokes
+    for stroke in drawn_lines_right:
+        if len(stroke) > 1:
+            pygame.draw.lines(screen, (0, 0, 0), False, stroke, PEN_WIDTH)
+    if drawing_right and len(current_stroke_right) > 1:
+        pygame.draw.lines(screen, (100, 100, 100), False, current_stroke_right, PEN_WIDTH)
 
-    # Balls
-    for ball in balls:
-        # Use floating point for center position
-        px = ball['pos']['x'] * C_SCALE
-        py = HEIGHT - ball['pos']['y'] * C_SCALE
-        # Calculate radius with ceiling to ensure we always round up
-        pr = math.ceil(ball['radius'] * C_SCALE)
-
-        # Draw a slightly larger filled circle to prevent gaps
-        pygame.gfxdraw.filled_circle(screen, int(px), int(py), pr, ball['color'])
-        # Add antialiased edge at the correct radius
-        pygame.gfxdraw.aacircle(screen, int(px), int(py), pr, ball['color'])
-        # Draw one pixel larger to fill any gaps
-        if pr > 1:
-            pygame.gfxdraw.aacircle(screen, int(px), int(py), pr - 1, ball['color'])
+    # Draw balls
+    draw_balls(balls_with_friction, screen_offset=0)
+    draw_balls(balls_without_friction, screen_offset=SCREEN_WIDTH)
 
     pygame.display.flip()
     clock.tick(60)
