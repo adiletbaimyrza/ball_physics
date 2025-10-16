@@ -11,7 +11,7 @@ pygame.init()
 WIDTH, HEIGHT = 1600, 600  # Double width for two screens
 SCREEN_WIDTH = WIDTH // 2  # Each screen is half
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Air Friction Comparison - Left: With Friction | Right: Without Friction")
+pygame.display.set_caption("Ball Physics Simulation - Left: With Friction | Right: Without Friction")
 
 clock = pygame.time.Clock()
 
@@ -37,17 +37,51 @@ class WindDirection(Enum):
 # Physics parameters -----------------------------------------------
 GRAVITY = {'x': 0.0, 'y': -10.0}
 TIME_STEP = 1.0 / 60.0
-AIR_FRICTION = 0.02  # Coefficient of air friction (0 = no friction, 1 = max friction)
+AIR_FRICTION = 0.98  # Damping coefficient (0-1, where 1 = no friction, 0.98 = 2% velocity loss per second)
 WIND_STRENGTH = 3.0  # Wind force strength
 current_wind = WindDirection.NONE
+
+# Ball Constants (NEW) ---------------------------------------------
+BALL_RADIUS = 0.5
+BALL_MIN_POS = {'x': 0.2, 'y': 0.2}
+BALL_MAX_POS = {'x': 1.0, 'y': 2.0}
+BALL_MIN_VEL = {'x': 6.0, 'y': 10.0}
+BALL_MAX_VEL = {'x': 12.0, 'y': 18.0}
 
 
 # Multiple balls ---------------------------------------------------
 def make_ball():
+    # Calculate safe spawning bounds, ensuring the ball's center is at least
+    # one radius away from the simulation edges (0 and SIM_WIDTH/HEIGHT).
+
+    # X-position bounds
+    x_min_bound = max(BALL_MIN_POS['x'], BALL_RADIUS)
+    x_max_bound = min(BALL_MAX_POS['x'], SIM_WIDTH - BALL_RADIUS)
+
+    # Y-position bounds
+    y_min_bound = max(BALL_MIN_POS['y'], BALL_RADIUS)
+    y_max_bound = min(BALL_MAX_POS['y'], SIM_HEIGHT - BALL_RADIUS)
+
+    # Note: If x_min_bound > x_max_bound, random.uniform will error.
+    # This design assumes the user-defined min/max positions are safe.
+    # We will use x_min_bound if the calculated range is invalid to prevent crash.
+
+    safe_x_start = x_min_bound
+    safe_x_end = max(x_min_bound, x_max_bound)
+
+    safe_y_start = y_min_bound
+    safe_y_end = max(y_min_bound, y_max_bound)
+
     return {
-        'radius': 1.2,
-        'pos': {'x': random.uniform(0.2, 1.0), 'y': random.uniform(0.2, 2.0)},
-        'vel': {'x': random.uniform(6.0, 12.0), 'y': random.uniform(10.0, 18.0)},
+        'radius': BALL_RADIUS,
+        'pos': {
+            'x': random.uniform(safe_x_start, safe_x_end),
+            'y': random.uniform(safe_y_start, safe_y_end)
+        },
+        'vel': {
+            'x': random.uniform(BALL_MIN_VEL['x'], BALL_MAX_VEL['x']),
+            'y': random.uniform(BALL_MIN_VEL['y'], BALL_MAX_VEL['y'])
+        },
         'color': [random.randint(100, 255) for _ in range(3)]
     }
 
@@ -113,9 +147,16 @@ current_stroke_right = []
 
 # Helper ------------------------------------------------------------
 def reflect_velocity(vel, normal):
+    # CORRECTION: Apply COR (e.g., 0.8) for better realism and energy loss
+    COR = 0.8
     dot = vel['x'] * normal[0] + vel['y'] * normal[1]
-    vel['x'] -= 2 * dot * normal[0]
-    vel['y'] -= 2 * dot * normal[1]
+
+    # Calculate reflected velocity
+    # v_reflected = v_incoming - (1 + COR) * (v_incoming . n) * n
+    impulse_magnitude = -(1 + COR) * dot
+
+    vel['x'] += impulse_magnitude * normal[0]
+    vel['y'] += impulse_magnitude * normal[1]
 
 
 # Collision detection with line segments ---------------------------
@@ -157,7 +198,18 @@ def check_line_collision(ball_pos, ball_radius, stroke, screen_offset=0):
             dy = ball_pos['y'] - cy
             d = math.sqrt(dx * dx + dy * dy)
             if d > 0:
-                return True, (dx / d, dy / d)
+                # Resolve penetration by moving the ball away from the line
+                # Push back amount is the penetration depth
+                penetration = collision_dist - dist
+
+                # Normalize the direction vector to get the collision normal
+                nx, ny = dx / d, dy / d
+
+                # Apply separation (to avoid jitter/sticking)
+                ball_pos['x'] += nx * penetration
+                ball_pos['y'] += ny * penetration
+
+                return True, (nx, ny)  # Return the normal vector
 
     return False, None
 
@@ -170,45 +222,56 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
     wind_force_y = wind_y * WIND_STRENGTH
 
     for ball in balls:
-        # Apply gravity
+        # 1. Apply Forces (Gravity + Wind)
         ball['vel']['x'] += GRAVITY['x'] * TIME_STEP
         ball['vel']['y'] += GRAVITY['y'] * TIME_STEP
 
-        # Apply wind force
         ball['vel']['x'] += wind_force_x * TIME_STEP
         ball['vel']['y'] += wind_force_y * TIME_STEP
 
-        # Apply air friction (only if apply_friction is True)
+        # 2. Apply Air Friction (Exponential Damping)
         if apply_friction:
-            friction_x = -AIR_FRICTION * ball['vel']['x']
-            friction_y = -AIR_FRICTION * ball['vel']['y']
-            ball['vel']['x'] += friction_x * TIME_STEP
-            ball['vel']['y'] += friction_y * TIME_STEP
+            damping = AIR_FRICTION ** TIME_STEP
+            ball['vel']['x'] *= damping
+            ball['vel']['y'] *= damping
 
-        # Update position
+        # 3. Update position (Velocity Integration - Semi-Implicit Euler)
         ball['pos']['x'] += ball['vel']['x'] * TIME_STEP
         ball['pos']['y'] += ball['vel']['y'] * TIME_STEP
 
-        # Border collisions
-        if ball['pos']['x'] < ball['radius']:
-            ball['pos']['x'] = ball['radius']
-            ball['vel']['x'] = -ball['vel']['x']
-        if ball['pos']['x'] > SIM_WIDTH - ball['radius']:
-            ball['pos']['x'] = SIM_WIDTH - ball['radius']
-            ball['vel']['x'] = -ball['vel']['x']
+        # 4. Border collisions with coefficient of restitution (COR=0.8)
+        COR_WALL = 0.8
+
+        # Bottom edge
         if ball['pos']['y'] < ball['radius']:
             ball['pos']['y'] = ball['radius']
-            ball['vel']['y'] = -ball['vel']['y']
+            ball['vel']['y'] = -ball['vel']['y'] * COR_WALL
 
-        # Line collisions
+        # Top edge (not usually relevant with downward gravity, but for completeness)
+        if ball['pos']['y'] > SIM_HEIGHT - ball['radius']:
+            ball['pos']['y'] = SIM_HEIGHT - ball['radius']
+            ball['vel']['y'] = -ball['vel']['y'] * COR_WALL
+
+        # Left edge
+        if ball['pos']['x'] < ball['radius']:
+            ball['pos']['x'] = ball['radius']
+            ball['vel']['x'] = -ball['vel']['x'] * COR_WALL
+
+        # Right edge
+        if ball['pos']['x'] > SIM_WIDTH - ball['radius']:
+            ball['pos']['x'] = SIM_WIDTH - ball['radius']
+            ball['vel']['x'] = -ball['vel']['x'] * COR_WALL
+
+        # 5. Line collisions
         for stroke in drawn_lines:
+            # check_line_collision now also handles separation
             collided, normal = check_line_collision(ball['pos'], ball['radius'], stroke, screen_offset)
             if collided:
-                reflect_velocity(ball['vel'], normal)
-                ball['pos']['x'] += normal[0] * 0.05
-                ball['pos']['y'] += normal[1] * 0.05
+                reflect_velocity(ball['vel'], normal)  # reflect_velocity now applies COR
 
-    # Ball-to-ball collisions
+    # 6. Ball-to-ball collisions (still assuming equal mass, but added COR)
+    COR_BALL = 0.95
+
     for i in range(len(balls)):
         for j in range(i + 1, len(balls)):
             b1, b2 = balls[i], balls[j]
@@ -219,15 +282,15 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
             min_dist = b1['radius'] + b2['radius']
 
             if dist2 < min_dist * min_dist:
-                dist = math.sqrt(dist2) if dist2 != 0 else 0.0001
+                dist = math.sqrt(dist2) if dist2 > 0 else 0.0001
                 nx, ny = dx / dist, dy / dist
 
                 # Separate overlapping balls
-                overlap = 0.5 * (min_dist - dist)
-                b1['pos']['x'] -= nx * overlap
-                b1['pos']['y'] -= ny * overlap
-                b2['pos']['x'] += nx * overlap
-                b2['pos']['y'] += ny * overlap
+                overlap = (min_dist - dist)
+                b1['pos']['x'] -= nx * overlap * 0.5
+                b1['pos']['y'] -= ny * overlap * 0.5
+                b2['pos']['x'] += nx * overlap * 0.5
+                b2['pos']['y'] += ny * overlap * 0.5
 
                 # Relative velocity along the normal
                 dvx = b2['vel']['x'] - b1['vel']['x']
@@ -235,25 +298,65 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
                 vn = dvx * nx + dvy * ny
 
                 if vn < 0:  # only collide if moving toward each other
-                    # Elastic collision (equal mass)
-                    impulse = -2 * vn / 2
-                    b1['vel']['x'] -= impulse * nx
-                    b1['vel']['y'] -= impulse * ny
-                    b2['vel']['x'] += impulse * nx
-                    b2['vel']['y'] += impulse * ny
+                    # Calculate impulse (assumes equal mass, applies COR)
+                    j_impulse = -(1 + COR_BALL) * vn / 2
+
+                    b1['vel']['x'] -= j_impulse * nx
+                    b1['vel']['y'] -= j_impulse * ny
+                    b2['vel']['x'] += j_impulse * nx
+                    b2['vel']['y'] += j_impulse * ny
 
 
 def draw_balls(balls, screen_offset=0):
-    """Draw balls with given screen offset"""
+    """Draw balls with given screen offset - with fake 3D shading"""
     for ball in balls:
         px = ball['pos']['x'] * C_SCALE + screen_offset
         py = HEIGHT - ball['pos']['y'] * C_SCALE
         pr = math.ceil(ball['radius'] * C_SCALE)
 
+        # Draw shadow (offset down and right)
+        shadow_color = (80, 80, 80)
+        pygame.gfxdraw.filled_circle(screen, int(px + 2), int(py + 2), pr, shadow_color)
+
+        # Draw darker base (bottom shading)
+        dark_color = tuple(max(0, int(c * 0.5)) for c in ball['color'])
+        pygame.gfxdraw.filled_circle(screen, int(px), int(py), pr, dark_color)
+
+        # Draw main ball color
         pygame.gfxdraw.filled_circle(screen, int(px), int(py), pr, ball['color'])
         pygame.gfxdraw.aacircle(screen, int(px), int(py), pr, ball['color'])
-        if pr > 1:
-            pygame.gfxdraw.aacircle(screen, int(px), int(py), pr - 1, ball['color'])
+
+        # Create radial gradient from center - lighter in middle, darker at edges
+        num_layers = max(5, pr // 2)
+        for i in range(num_layers):
+            factor = 1 - (i / num_layers)  # 1 at center, 0 at edge
+            # Darken towards the edges
+            shade_color = tuple(max(0, int(c * (0.6 + 0.4 * factor))) for c in ball['color'])
+            layer_radius = int(pr * factor)
+            if layer_radius > 1:
+                pygame.gfxdraw.filled_circle(screen, int(px), int(py), layer_radius, shade_color)
+
+        # Add subtle highlight (top-left) for glossy sphere effect
+        highlight_radius = max(2, pr // 4)
+        highlight_x = int(px - pr * 0.35)
+        highlight_y = int(py - pr * 0.35)
+
+        # Soft highlight with gradient - no white, just lighter version of ball color
+        for i in range(3):
+            alpha_factor = 1 - (i / 3)
+            highlight_color = tuple(min(255, int(c + (255 - c) * alpha_factor * 0.5)) for c in ball['color'])
+            h_radius = highlight_radius - i
+            if h_radius > 0:
+                pygame.gfxdraw.filled_circle(screen, highlight_x, highlight_y, h_radius, highlight_color)
+
+        # Very small, subtle specular highlight at center
+        spec_radius = max(1, pr // 8)
+        spec_color = (255, 255, 255)
+        pygame.gfxdraw.filled_circle(screen, int(px - pr * 0.3), int(py - pr * 0.3), spec_radius, spec_color)
+
+        # Edge outline for definition
+        edge_color = tuple(max(0, c - 50) for c in ball['color'])
+        pygame.gfxdraw.aacircle(screen, int(px), int(py), pr, edge_color)
 
 
 # Main loop --------------------------------------------------------
