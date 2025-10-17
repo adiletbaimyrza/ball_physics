@@ -44,11 +44,11 @@ current_wind = WindDirection.NONE
 # Ball Constants (UPDATED with variable Radius) --------------------
 # Mass range
 BALL_MIN_MASS = 1.0
-BALL_MAX_MASS = 5.0
+BALL_MAX_MASS = 10.0
 
 # Radius range (linked to mass for visual size)
 BALL_MIN_RADIUS = 0.3
-BALL_MAX_RADIUS = 0.7
+BALL_MAX_RADIUS = 0.9
 
 # Position and Velocity bounds
 BALL_MIN_POS = {'x': 0.2, 'y': 0.2}
@@ -172,6 +172,32 @@ drawing_right = False
 current_stroke_left = []
 current_stroke_right = []
 
+# --- NEW: Ball holding state ---
+held_ball_left = -1
+held_ball_right = -1
+last_ball_x = 0.0
+last_ball_y = 0.0
+last_update_time = 0.0
+
+
+# Helper for Ball Grab ----------------------------------------
+def check_ball_click(pos_x, pos_y, balls, screen_offset=0):
+    """Checks if mouse is over a ball and returns the ball index if true."""
+    for i, ball in enumerate(balls):
+        # Convert mouse screen position to simulation coordinates
+        sim_x = (pos_x - screen_offset) / C_SCALE
+        # Correct Sim Y conversion (Y is inverted in Pygame)
+        sim_y = (HEIGHT - pos_y) / C_SCALE
+
+        dx = ball['pos']['x'] - sim_x
+        dy = ball['pos']['y'] - sim_y
+        dist = math.sqrt(dx * dx + dy * dy)
+
+        # Check if distance is less than the ball radius + a small tolerance for clicking
+        if dist < ball['radius'] + (2 / C_SCALE):
+            return i
+    return -1
+
 
 # Helper ------------------------------------------------------------
 def reflect_velocity(vel, normal):
@@ -211,8 +237,8 @@ def check_line_collision(ball_pos, ball_radius, stroke, screen_offset=0):
         x2, y2 = stroke[i + 1]
 
         # Convert to simulation coordinates (adjust for screen offset)
-        sx1, sy1 = (x1 - screen_offset) / C_SCALE, inv_cY(y1)
-        sx2, sy2 = (x2 - screen_offset) / C_SCALE, inv_cY(y2)
+        sx1, sy1 = (x1 - screen_offset) / C_SCALE, (HEIGHT - y1) / C_SCALE
+        sx2, sy2 = (x2 - screen_offset) / C_SCALE, (HEIGHT - y2) / C_SCALE
 
         dist, (cx, cy) = point_to_segment_distance(
             ball_pos['x'], ball_pos['y'], sx1, sy1, sx2, sy2
@@ -345,8 +371,8 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
 
 
 def draw_balls(balls, screen_offset=0):
-    """Draw balls with given screen offset - with fake 3D shading"""
-    for ball in balls:
+    """Draw balls with given screen offset - with fake 3D shading and holding highlight"""
+    for i, ball in enumerate(balls):
         px = ball['pos']['x'] * C_SCALE + screen_offset
         py = HEIGHT - ball['pos']['y'] * C_SCALE
         # Use math.ceil to ensure radius is at least 1 pixel wide
@@ -366,8 +392,8 @@ def draw_balls(balls, screen_offset=0):
 
         # Create radial gradient from center - lighter in middle, darker at edges
         num_layers = max(5, pr // 2)
-        for i in range(num_layers):
-            factor = 1 - (i / num_layers)  # 1 at center, 0 at edge
+        for j in range(num_layers):
+            factor = 1 - (j / num_layers)  # 1 at center, 0 at edge
             # Darken towards the edges
             shade_color = tuple(max(0, int(c * (0.6 + 0.4 * factor))) for c in ball['color'])
             layer_radius = int(pr * factor)
@@ -380,10 +406,10 @@ def draw_balls(balls, screen_offset=0):
         highlight_y = int(py - pr * 0.35)
 
         # Soft highlight with gradient - no white, just lighter version of ball color
-        for i in range(3):
-            alpha_factor = 1 - (i / 3)
+        for j in range(3):
+            alpha_factor = 1 - (j / 3)
             highlight_color = tuple(min(255, int(c + (255 - c) * alpha_factor * 0.5)) for c in ball['color'])
-            h_radius = highlight_radius - i
+            h_radius = highlight_radius - j
             if h_radius > 0:
                 pygame.gfxdraw.filled_circle(screen, highlight_x, highlight_y, h_radius, highlight_color)
 
@@ -396,60 +422,156 @@ def draw_balls(balls, screen_offset=0):
         edge_color = tuple(max(0, c - 50) for c in ball['color'])
         pygame.gfxdraw.aacircle(screen, int(px), int(py), pr, edge_color)
 
+        # --- NEW: Highlight held ball ---
+        is_held = (screen_offset == 0 and i == held_ball_left) or \
+                  (screen_offset == SCREEN_WIDTH and i == held_ball_right)
+
+        if is_held:
+            # Draw a thick white ring around the held ball
+            ring_color = (255, 255, 255)
+            # Draw three concentric rings for a thicker look
+            for r_offset in range(2, 5):
+                pygame.gfxdraw.aacircle(screen, int(px), int(py), pr + r_offset, ring_color)
+
 
 # Main loop --------------------------------------------------------
 running = True
 while running:
     mouse_pos = pygame.mouse.get_pos()
+    current_time = pygame.time.get_ticks() / 1000.0  # Global time in seconds
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
 
         elif event.type == pygame.MOUSEBUTTONDOWN:
-            if start_button_rect.collidepoint(event.pos):
-                running_sim = True
-            elif pause_button_rect.collidepoint(event.pos):
+            mouse_x, mouse_y = event.pos
+
+            # --- 1. Try to Grab a Ball ---
+            is_left_screen = mouse_x < SCREEN_WIDTH
+            ball_list = balls_with_friction if is_left_screen else balls_without_friction
+            screen_x_offset = 0 if is_left_screen else SCREEN_WIDTH
+
+            idx = check_ball_click(mouse_x, mouse_y, ball_list, screen_offset=screen_x_offset)
+
+            if idx != -1:
+                # Ball grabbed!
+                held_ball_left = idx if is_left_screen else -1
+                held_ball_right = idx if not is_left_screen else -1
+
+                # Pause simulation while holding
                 running_sim = False
-            elif restart_button_rect.collidepoint(event.pos):
-                # Restart: clear everything and create new balls
-                running_sim = False
-                balls_with_friction = [make_ball() for _ in range(3)]
-                balls_without_friction = [copy_ball(b) for b in balls_with_friction]
-                drawn_lines_left = []
-                drawn_lines_right = []
-                current_wind = WindDirection.NONE
-            elif add_ball_button_rect.collidepoint(event.pos):
-                new_ball = make_ball()
-                balls_with_friction.append(new_ball)
-                balls_without_friction.append(copy_ball(new_ball))
-            elif wind_none_rect.collidepoint(event.pos):
-                current_wind = WindDirection.NONE
-            elif wind_left_rect.collidepoint(event.pos):
-                current_wind = WindDirection.LEFT
-            elif wind_right_rect.collidepoint(event.pos):
-                current_wind = WindDirection.RIGHT
-            elif wind_up_rect.collidepoint(event.pos):
-                current_wind = WindDirection.UP
-            elif wind_down_rect.collidepoint(event.pos):
-                current_wind = WindDirection.DOWN
-            elif not running_sim:
+
+                # Set initial state for throwing calculation
+                # Convert mouse position to sim coordinates
+                sim_x = (mouse_x - screen_x_offset) / C_SCALE
+                sim_y = (HEIGHT - mouse_y) / C_SCALE
+
+                # Snap ball to mouse position immediately and record
+                ball_list[idx]['pos']['x'] = sim_x
+                ball_list[idx]['pos']['y'] = sim_y
+                # Stop the ball's existing movement to prevent conflict while dragging
+                ball_list[idx]['vel']['x'] = 0.0
+                ball_list[idx]['vel']['y'] = 0.0
+
+                last_ball_x = sim_x
+                last_ball_y = sim_y
+                last_update_time = current_time
+
+            # --- 2. Handle Buttons/Drawing (ONLY if no ball was grabbed) ---
+            elif held_ball_left == -1 and held_ball_right == -1:
+                if start_button_rect.collidepoint(event.pos):
+                    running_sim = True
+                elif pause_button_rect.collidepoint(event.pos):
+                    running_sim = False
+                elif restart_button_rect.collidepoint(event.pos):
+                    # Restart: clear everything and create new balls
+                    running_sim = False
+                    balls_with_friction = [make_ball() for _ in range(3)]
+                    balls_without_friction = [copy_ball(b) for b in balls_with_friction]
+                    drawn_lines_left = []
+                    drawn_lines_right = []
+                    current_wind = WindDirection.NONE
+                elif add_ball_button_rect.collidepoint(event.pos):
+                    new_ball = make_ball()
+                    balls_with_friction.append(new_ball)
+                    balls_without_friction.append(copy_ball(new_ball))
+                elif wind_none_rect.collidepoint(event.pos):
+                    current_wind = WindDirection.NONE
+                elif wind_left_rect.collidepoint(event.pos):
+                    current_wind = WindDirection.LEFT
+                elif wind_right_rect.collidepoint(event.pos):
+                    current_wind = WindDirection.RIGHT
+                elif wind_up_rect.collidepoint(event.pos):
+                    current_wind = WindDirection.UP
+                elif wind_down_rect.collidepoint(event.pos):
+                    current_wind = WindDirection.DOWN
+
                 # Start drawing on left or right screen
-                if event.pos[0] < SCREEN_WIDTH:
-                    drawing_left = True
-                    current_stroke_left = [event.pos]
-                else:
-                    drawing_right = True
-                    current_stroke_right = [event.pos]
+                elif not running_sim:
+                    if is_left_screen:
+                        drawing_left = True
+                        current_stroke_left = [event.pos]
+                    else:
+                        drawing_right = True
+                        current_stroke_right = [event.pos]
 
         elif event.type == pygame.MOUSEMOTION:
-            if drawing_left:
+            mouse_x, mouse_y = event.pos
+
+            # --- 1. Drag a Held Ball ---
+            ball_list = None
+            ball_idx = -1
+            screen_x_offset = 0
+
+            if held_ball_left != -1:
+                ball_list = balls_with_friction
+                ball_idx = held_ball_left
+            elif held_ball_right != -1:
+                ball_list = balls_without_friction
+                ball_idx = held_ball_right
+                screen_x_offset = SCREEN_WIDTH
+
+            if ball_list is not None:
+                dt = current_time - last_update_time
+
+                # Convert mouse position to sim coordinates
+                sim_x = (mouse_x - screen_x_offset) / C_SCALE
+                sim_y = (HEIGHT - mouse_y) / C_SCALE
+
+                # Calculate instantaneous velocity based on delta movement / delta time
+                if dt > 0.001:  # Avoid division by zero/near-zero
+                    # This velocity will be applied on release
+                    ball_list[ball_idx]['vel']['x'] = (sim_x - last_ball_x) / dt
+                    ball_list[ball_idx]['vel']['y'] = (sim_y - last_ball_y) / dt
+
+                # Update ball position to follow mouse
+                ball_list[ball_idx]['pos']['x'] = sim_x
+                ball_list[ball_idx]['pos']['y'] = sim_y
+
+                # Update tracking variables
+                last_ball_x = sim_x
+                last_ball_y = sim_y
+                last_update_time = current_time
+
+            # --- 2. Handle Drawing Motion (ONLY if no ball is held) ---
+            elif drawing_left:
                 current_stroke_left.append(event.pos)
             elif drawing_right:
                 current_stroke_right.append(event.pos)
 
         elif event.type == pygame.MOUSEBUTTONUP:
-            if drawing_left:
+
+            # --- 1. Release/Throw Ball ---
+            if held_ball_left != -1 or held_ball_right != -1:
+                # Velocity was calculated and updated during MOUSEMOTION (Throwing action)
+                # Reset holding state and resume simulation
+                held_ball_left = -1
+                held_ball_right = -1
+                running_sim = True
+
+            # --- 2. Handle Drawing Release (ONLY if no ball was released) ---
+            elif drawing_left:
                 if len(current_stroke_left) > 1:
                     drawn_lines_left.append(current_stroke_left)
                 current_stroke_left = []
@@ -461,8 +583,10 @@ while running:
                 drawing_right = False
 
     if running_sim:
-        simulate_balls(balls_with_friction, drawn_lines_left, apply_friction=True, screen_offset=0)
-        simulate_balls(balls_without_friction, drawn_lines_right, apply_friction=False, screen_offset=SCREEN_WIDTH)
+        # Check if any ball is held, and only simulate if none are held
+        if held_ball_left == -1 and held_ball_right == -1:
+            simulate_balls(balls_with_friction, drawn_lines_left, apply_friction=True, screen_offset=0)
+            simulate_balls(balls_without_friction, drawn_lines_right, apply_friction=False, screen_offset=SCREEN_WIDTH)
 
     # Drawing -------------------------------------------------------
     screen.fill((255, 255, 255))
