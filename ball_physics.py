@@ -36,10 +36,15 @@ class WindDirection(Enum):
 
 # Physics parameters -----------------------------------------------
 GRAVITY = {'x': 0.0, 'y': -10.0}
-TIME_STEP = 1.0 / 60.0
+TIME_STEP = 1.0 / 30.0
 AIR_FRICTION = 0.98  # Damping coefficient (0-1, where 1 = no friction, 0.98 = 2% velocity loss per second)
 WIND_STRENGTH = 3.0  # Wind force strength
 current_wind = WindDirection.NONE
+
+# NEW: Threshold for putting balls to sleep to prevent jitter
+# We use the squared value to avoid costly square root operations
+SLEEP_VELOCITY_SQ = 0.01 * 0.01
+
 
 # Ball Constants (UPDATED with variable Radius) --------------------
 # Mass range
@@ -127,8 +132,7 @@ def copy_ball(ball):
 balls_with_friction = [make_ball() for _ in range(3)]  # Left screen
 balls_without_friction = [copy_ball(b) for b in balls_with_friction]  # Right screen (copies)
 
-drawn_lines_left = []  # Store drawn pen strokes for left screen
-drawn_lines_right = []  # Store drawn pen strokes for right screen
+drawn_lines = []  # Store drawn pen strokes (shared across all screens)
 PEN_WIDTH = 5  # Width of the pen stroke
 
 # UI Buttons -------------------------------------------------------
@@ -167,10 +171,8 @@ wind_up_rect = pygame.Rect(90, 80, SMALL_BUTTON_WIDTH, 30)
 wind_down_rect = pygame.Rect(90, 160, SMALL_BUTTON_WIDTH, 30)
 
 running_sim = False
-drawing_left = False
-drawing_right = False
-current_stroke_left = []
-current_stroke_right = []
+drawing = False
+current_stroke = []
 
 # --- NEW: Ball holding state ---
 held_ball_left = -1
@@ -227,45 +229,114 @@ def point_to_segment_distance(px, py, x1, y1, x2, y2):
     return math.sqrt((px - closest_x) ** 2 + (py - closest_y) ** 2), (closest_x, closest_y)
 
 
-def check_line_collision(ball_pos, ball_radius, stroke, screen_offset=0):
-    """Check collision between ball and a pen stroke"""
+def line_segment_intersection(x1, y1, x2, y2, x3, y3, x4, y4):
+    """Check if line segments (x1,y1)-(x2,y2) and (x3,y3)-(x4,y4) intersect"""
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-10:
+        return False, None, None
+
+    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+    u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+
+    if 0 <= t <= 1 and 0 <= u <= 1:
+        ix = x1 + t * (x2 - x1)
+        iy = y1 + t * (y2 - y1)
+        return True, ix, iy
+    return False, None, None
+
+
+def check_line_collision_swept(old_pos, new_pos, ball_radius, stroke, screen_offset=0):
+    """Check collision between ball trajectory and pen stroke using swept collision"""
     if len(stroke) < 2:
-        return False, None
+        return False, None, None, None
+
+    collision_happened = False
+    best_t = 2.0  # Beyond the range [0,1]
+    best_normal = None
+    best_point = None
 
     for i in range(len(stroke) - 1):
-        x1, y1 = stroke[i]
-        x2, y2 = stroke[i + 1]
+        # stroke now contains normalized coordinates (0-1)
+        rel_x1, rel_y1 = stroke[i]
+        rel_x2, rel_y2 = stroke[i + 1]
 
-        # Convert to simulation coordinates (adjust for screen offset)
+        # Convert normalized coordinates to absolute screen coordinates
+        x1 = rel_x1 * SCREEN_WIDTH + screen_offset
+        y1 = rel_y1 * HEIGHT
+        x2 = rel_x2 * SCREEN_WIDTH + screen_offset
+        y2 = rel_y2 * HEIGHT
+
+        # Convert to simulation coordinates
         sx1, sy1 = (x1 - screen_offset) / C_SCALE, (HEIGHT - y1) / C_SCALE
         sx2, sy2 = (x2 - screen_offset) / C_SCALE, (HEIGHT - y2) / C_SCALE
 
-        dist, (cx, cy) = point_to_segment_distance(
-            ball_pos['x'], ball_pos['y'], sx1, sy1, sx2, sy2
+        # Check distance at start and end positions
+        dist_old, (cx_old, cy_old) = point_to_segment_distance(
+            old_pos['x'], old_pos['y'], sx1, sy1, sx2, sy2
+        )
+        dist_new, (cx_new, cy_new) = point_to_segment_distance(
+            new_pos['x'], new_pos['y'], sx1, sy1, sx2, sy2
         )
 
         collision_dist = ball_radius + (PEN_WIDTH / 2) / C_SCALE
 
-        if dist < collision_dist:
-            # Calculate normal
-            dx = ball_pos['x'] - cx
-            dy = ball_pos['y'] - cy
-            d = math.sqrt(dx * dx + dy * dy)
-            if d > 0:
-                # Resolve penetration by moving the ball away from the line
-                # Push back amount is the penetration depth
-                penetration = collision_dist - dist
+        # If we're penetrating at the new position, we need to handle it
+        if dist_new < collision_dist:
+            # Check if we crossed the line during this frame
+            # Use ray-casting from old to new position
+            intersects, ix, iy = line_segment_intersection(
+                old_pos['x'], old_pos['y'], new_pos['x'], new_pos['y'],
+                sx1, sy1, sx2, sy2
+            )
 
-                # Normalize the direction vector to get the collision normal
-                nx, ny = dx / d, dy / d
+            # Calculate when collision occurred (parametric t along movement path)
+            dx_move = new_pos['x'] - old_pos['x']
+            dy_move = new_pos['y'] - old_pos['y']
+            move_len = math.sqrt(dx_move * dx_move + dy_move * dy_move)
 
-                # Apply separation (to avoid jitter/sticking)
-                ball_pos['x'] += nx * penetration
-                ball_pos['y'] += ny * penetration
+            if move_len > 1e-6:
+                # Find the closest point along the trajectory to the line segment
+                # This handles both direct intersections and grazing collisions
+                t_collision = 0.0
 
-                return True, (nx, ny)  # Return the normal vector
+                if intersects:
+                    # Direct intersection - calculate t
+                    dx_to_intersection = ix - old_pos['x']
+                    dy_to_intersection = iy - old_pos['y']
+                    t_collision = math.sqrt(dx_to_intersection ** 2 + dy_to_intersection ** 2) / move_len
+                else:
+                    # Grazing collision - estimate t from distance changes
+                    if dist_old > collision_dist:
+                        # We were outside, now inside - approximate t
+                        t_collision = (dist_old - collision_dist) / (dist_old - dist_new + 1e-6)
+                    else:
+                        t_collision = 0.0
 
-    return False, None
+                t_collision = max(0.0, min(1.0, t_collision))
+
+                # Only update if this is the earliest collision
+                if t_collision < best_t:
+                    best_t = t_collision
+
+                    # Calculate collision point on trajectory
+                    collision_x = old_pos['x'] + t_collision * dx_move
+                    collision_y = old_pos['y'] + t_collision * dy_move
+
+                    # Find closest point on line segment at collision time
+                    _, (cpx, cpy) = point_to_segment_distance(
+                        collision_x, collision_y, sx1, sy1, sx2, sy2
+                    )
+
+                    # Calculate normal
+                    dx = collision_x - cpx
+                    dy = collision_y - cpy
+                    d = math.sqrt(dx * dx + dy * dy)
+                    if d > 1e-6:
+                        best_normal = (dx / d, dy / d)
+                        best_point = (cpx, cpy)
+                        collision_happened = True
+
+    return collision_happened, best_normal, best_point, best_t
 
 
 # Simulation --------------------------------------------------------
@@ -276,15 +347,14 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
     wind_force_y = wind_y * WIND_STRENGTH
 
     for ball in balls:
-        # 1. Apply Forces (Gravity + Wind)
+        # Store old position for swept collision detection
+        old_pos = {'x': ball['pos']['x'], 'y': ball['pos']['y']}
 
-        # Gravity: GRAVITY is defined as acceleration (g), which is mass-independent.
-        # v = u + a*t -> dv = a*dt
+        # 1. Apply Forces (Gravity + Wind)
         ball['vel']['x'] += GRAVITY['x'] * TIME_STEP
         ball['vel']['y'] += GRAVITY['y'] * TIME_STEP
 
         # Wind: Wind is a force (F). Acceleration is F/m.
-        # dv = (F/m) * dt
         mass = ball['mass']
         ball['vel']['x'] += (wind_force_x / mass) * TIME_STEP
         ball['vel']['y'] += (wind_force_y / mass) * TIME_STEP
@@ -299,7 +369,25 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
         ball['pos']['x'] += ball['vel']['x'] * TIME_STEP
         ball['pos']['y'] += ball['vel']['y'] * TIME_STEP
 
-        # 4. Border collisions with coefficient of restitution (COR=0.8)
+        # 4. Line collisions with swept collision detection
+        for stroke in drawn_lines:
+            collided, normal, collision_point, t = check_line_collision_swept(
+                old_pos, ball['pos'], ball['radius'], stroke, screen_offset
+            )
+            if collided and normal is not None:
+                # Move ball back to collision point
+                ball['pos']['x'] = old_pos['x'] + t * (ball['pos']['x'] - old_pos['x'])
+                ball['pos']['y'] = old_pos['y'] + t * (ball['pos']['y'] - old_pos['y'])
+
+                # Push ball away from line to prevent sticking
+                penetration_fix = ball['radius'] + (PEN_WIDTH / 2) / C_SCALE + 0.01
+                ball['pos']['x'] = collision_point[0] + normal[0] * penetration_fix
+                ball['pos']['y'] = collision_point[1] + normal[1] * penetration_fix
+
+                # Reflect velocity
+                reflect_velocity(ball['vel'], normal)
+
+        # 5. Border collisions with coefficient of restitution (COR=0.8)
         COR_WALL = 0.8
 
         # Bottom edge
@@ -307,7 +395,7 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
             ball['pos']['y'] = ball['radius']
             ball['vel']['y'] = -ball['vel']['y'] * COR_WALL
 
-        # Top edge (not usually relevant with downward gravity, but for completeness)
+        # Top edge
         if ball['pos']['y'] > SIM_HEIGHT - ball['radius']:
             ball['pos']['y'] = SIM_HEIGHT - ball['radius']
             ball['vel']['y'] = -ball['vel']['y'] * COR_WALL
@@ -322,14 +410,7 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
             ball['pos']['x'] = SIM_WIDTH - ball['radius']
             ball['vel']['x'] = -ball['vel']['x'] * COR_WALL
 
-        # 5. Line collisions
-        for stroke in drawn_lines:
-            # check_line_collision now also handles separation
-            collided, normal = check_line_collision(ball['pos'], ball['radius'], stroke, screen_offset)
-            if collided:
-                reflect_velocity(ball['vel'], normal)  # reflect_velocity now applies COR
-
-    # 6. Ball-to-ball collisions (UPDATED for variable mass)
+    # 6. Ball-to-ball collisions
     COR_BALL = 0.95
 
     for i in range(len(balls)):
@@ -358,16 +439,24 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
                 vn = dvx * nx + dvy * ny
 
                 if vn < 0:  # only collide if moving toward each other
-                    # Calculate impulse for unequal masses (Conservation of Momentum)
-                    # Impulse j = -(1 + COR) * (vn) / (1/m1 + 1/m2)
+                    # Calculate impulse for unequal masses
                     mass_sum_inv = 1.0 / b1['mass'] + 1.0 / b2['mass']
                     j_impulse = -(1 + COR_BALL) * vn / mass_sum_inv
 
-                    # Apply impulse change to velocity: dv = J / m
+                    # Apply impulse change to velocity
                     b1['vel']['x'] -= (j_impulse / b1['mass']) * nx
                     b1['vel']['y'] -= (j_impulse / b1['mass']) * ny
                     b2['vel']['x'] += (j_impulse / b2['mass']) * nx
                     b2['vel']['y'] += (j_impulse / b2['mass']) * ny
+
+    # FINAL CHECK TO PREVENT JITTER
+    # This loop must be separate, after all collisions are resolved
+    for ball in balls:
+        # Put balls to sleep if they are barely moving
+        speed_sq = ball['vel']['x'] ** 2 + ball['vel']['y'] ** 2
+        if speed_sq < SLEEP_VELOCITY_SQ:
+            ball['vel']['x'] = 0.0
+            ball['vel']['y'] = 0.0
 
 
 def draw_balls(balls, screen_offset=0):
@@ -375,14 +464,13 @@ def draw_balls(balls, screen_offset=0):
     for i, ball in enumerate(balls):
         px = ball['pos']['x'] * C_SCALE + screen_offset
         py = HEIGHT - ball['pos']['y'] * C_SCALE
-        # Use math.ceil to ensure radius is at least 1 pixel wide
         pr = math.ceil(ball['radius'] * C_SCALE)
 
-        # Draw shadow (offset down and right)
+        # Draw shadow
         shadow_color = (80, 80, 80)
         pygame.gfxdraw.filled_circle(screen, int(px + 2), int(py + 2), pr, shadow_color)
 
-        # Draw darker base (bottom shading)
+        # Draw darker base
         dark_color = tuple(max(0, int(c * 0.5)) for c in ball['color'])
         pygame.gfxdraw.filled_circle(screen, int(px), int(py), pr, dark_color)
 
@@ -390,22 +478,20 @@ def draw_balls(balls, screen_offset=0):
         pygame.gfxdraw.filled_circle(screen, int(px), int(py), pr, ball['color'])
         pygame.gfxdraw.aacircle(screen, int(px), int(py), pr, ball['color'])
 
-        # Create radial gradient from center - lighter in middle, darker at edges
+        # Create radial gradient
         num_layers = max(5, pr // 2)
         for j in range(num_layers):
-            factor = 1 - (j / num_layers)  # 1 at center, 0 at edge
-            # Darken towards the edges
+            factor = 1 - (j / num_layers)
             shade_color = tuple(max(0, int(c * (0.6 + 0.4 * factor))) for c in ball['color'])
             layer_radius = int(pr * factor)
             if layer_radius > 1:
                 pygame.gfxdraw.filled_circle(screen, int(px), int(py), layer_radius, shade_color)
 
-        # Add subtle highlight (top-left) for glossy sphere effect
+        # Add highlight
         highlight_radius = max(2, pr // 4)
         highlight_x = int(px - pr * 0.35)
         highlight_y = int(py - pr * 0.35)
 
-        # Soft highlight with gradient - no white, just lighter version of ball color
         for j in range(3):
             alpha_factor = 1 - (j / 3)
             highlight_color = tuple(min(255, int(c + (255 - c) * alpha_factor * 0.5)) for c in ball['color'])
@@ -413,23 +499,21 @@ def draw_balls(balls, screen_offset=0):
             if h_radius > 0:
                 pygame.gfxdraw.filled_circle(screen, highlight_x, highlight_y, h_radius, highlight_color)
 
-        # Very small, subtle specular highlight at center
+        # Specular highlight
         spec_radius = max(1, pr // 8)
         spec_color = (255, 255, 255)
         pygame.gfxdraw.filled_circle(screen, int(px - pr * 0.3), int(py - pr * 0.3), spec_radius, spec_color)
 
-        # Edge outline for definition
+        # Edge outline
         edge_color = tuple(max(0, c - 50) for c in ball['color'])
         pygame.gfxdraw.aacircle(screen, int(px), int(py), pr, edge_color)
 
-        # --- NEW: Highlight held ball ---
+        # Highlight held ball
         is_held = (screen_offset == 0 and i == held_ball_left) or \
                   (screen_offset == SCREEN_WIDTH and i == held_ball_right)
 
         if is_held:
-            # Draw a thick white ring around the held ball
             ring_color = (255, 255, 255)
-            # Draw three concentric rings for a thicker look
             for r_offset in range(2, 5):
                 pygame.gfxdraw.aacircle(screen, int(px), int(py), pr + r_offset, ring_color)
 
@@ -438,7 +522,7 @@ def draw_balls(balls, screen_offset=0):
 running = True
 while running:
     mouse_pos = pygame.mouse.get_pos()
-    current_time = pygame.time.get_ticks() / 1000.0  # Global time in seconds
+    current_time = pygame.time.get_ticks() / 1000.0
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -447,7 +531,6 @@ while running:
         elif event.type == pygame.MOUSEBUTTONDOWN:
             mouse_x, mouse_y = event.pos
 
-            # --- 1. Try to Grab a Ball ---
             is_left_screen = mouse_x < SCREEN_WIDTH
             ball_list = balls_with_friction if is_left_screen else balls_without_friction
             screen_x_offset = 0 if is_left_screen else SCREEN_WIDTH
@@ -455,22 +538,15 @@ while running:
             idx = check_ball_click(mouse_x, mouse_y, ball_list, screen_offset=screen_x_offset)
 
             if idx != -1:
-                # Ball grabbed!
                 held_ball_left = idx if is_left_screen else -1
                 held_ball_right = idx if not is_left_screen else -1
-
-                # Pause simulation while holding
                 running_sim = False
 
-                # Set initial state for throwing calculation
-                # Convert mouse position to sim coordinates
                 sim_x = (mouse_x - screen_x_offset) / C_SCALE
                 sim_y = (HEIGHT - mouse_y) / C_SCALE
 
-                # Snap ball to mouse position immediately and record
                 ball_list[idx]['pos']['x'] = sim_x
                 ball_list[idx]['pos']['y'] = sim_y
-                # Stop the ball's existing movement to prevent conflict while dragging
                 ball_list[idx]['vel']['x'] = 0.0
                 ball_list[idx]['vel']['y'] = 0.0
 
@@ -478,19 +554,16 @@ while running:
                 last_ball_y = sim_y
                 last_update_time = current_time
 
-            # --- 2. Handle Buttons/Drawing (ONLY if no ball was grabbed) ---
             elif held_ball_left == -1 and held_ball_right == -1:
                 if start_button_rect.collidepoint(event.pos):
                     running_sim = True
                 elif pause_button_rect.collidepoint(event.pos):
                     running_sim = False
                 elif restart_button_rect.collidepoint(event.pos):
-                    # Restart: clear everything and create new balls
                     running_sim = False
                     balls_with_friction = [make_ball() for _ in range(3)]
                     balls_without_friction = [copy_ball(b) for b in balls_with_friction]
-                    drawn_lines_left = []
-                    drawn_lines_right = []
+                    drawn_lines = []
                     current_wind = WindDirection.NONE
                 elif add_ball_button_rect.collidepoint(event.pos):
                     new_ball = make_ball()
@@ -506,20 +579,20 @@ while running:
                     current_wind = WindDirection.UP
                 elif wind_down_rect.collidepoint(event.pos):
                     current_wind = WindDirection.DOWN
-
-                # Start drawing on left or right screen
                 elif not running_sim:
+                    # Start drawing - store relative position (normalized 0-1)
+                    drawing = True
+                    # Normalize x position to 0-1 range within one screen
                     if is_left_screen:
-                        drawing_left = True
-                        current_stroke_left = [event.pos]
+                        rel_x = mouse_x / SCREEN_WIDTH
                     else:
-                        drawing_right = True
-                        current_stroke_right = [event.pos]
+                        rel_x = (mouse_x - SCREEN_WIDTH) / SCREEN_WIDTH
+                    rel_y = mouse_y / HEIGHT
+                    current_stroke = [(rel_x, rel_y)]
 
         elif event.type == pygame.MOUSEMOTION:
             mouse_x, mouse_y = event.pos
 
-            # --- 1. Drag a Held Ball ---
             ball_list = None
             ball_idx = -1
             screen_x_offset = 0
@@ -535,58 +608,45 @@ while running:
             if ball_list is not None:
                 dt = current_time - last_update_time
 
-                # Convert mouse position to sim coordinates
                 sim_x = (mouse_x - screen_x_offset) / C_SCALE
                 sim_y = (HEIGHT - mouse_y) / C_SCALE
 
-                # Calculate instantaneous velocity based on delta movement / delta time
-                if dt > 0.001:  # Avoid division by zero/near-zero
-                    # This velocity will be applied on release
+                if dt > 0.001:
                     ball_list[ball_idx]['vel']['x'] = (sim_x - last_ball_x) / dt
                     ball_list[ball_idx]['vel']['y'] = (sim_y - last_ball_y) / dt
 
-                # Update ball position to follow mouse
                 ball_list[ball_idx]['pos']['x'] = sim_x
                 ball_list[ball_idx]['pos']['y'] = sim_y
 
-                # Update tracking variables
                 last_ball_x = sim_x
                 last_ball_y = sim_y
                 last_update_time = current_time
 
-            # --- 2. Handle Drawing Motion (ONLY if no ball is held) ---
-            elif drawing_left:
-                current_stroke_left.append(event.pos)
-            elif drawing_right:
-                current_stroke_right.append(event.pos)
+            elif drawing:
+                # Store normalized coordinates
+                is_left_screen = mouse_x < SCREEN_WIDTH
+                if is_left_screen:
+                    rel_x = mouse_x / SCREEN_WIDTH
+                else:
+                    rel_x = (mouse_x - SCREEN_WIDTH) / SCREEN_WIDTH
+                rel_y = mouse_y / HEIGHT
+                current_stroke.append((rel_x, rel_y))
 
         elif event.type == pygame.MOUSEBUTTONUP:
-
-            # --- 1. Release/Throw Ball ---
             if held_ball_left != -1 or held_ball_right != -1:
-                # Velocity was calculated and updated during MOUSEMOTION (Throwing action)
-                # Reset holding state and resume simulation
                 held_ball_left = -1
                 held_ball_right = -1
                 running_sim = True
-
-            # --- 2. Handle Drawing Release (ONLY if no ball was released) ---
-            elif drawing_left:
-                if len(current_stroke_left) > 1:
-                    drawn_lines_left.append(current_stroke_left)
-                current_stroke_left = []
-                drawing_left = False
-            elif drawing_right:
-                if len(current_stroke_right) > 1:
-                    drawn_lines_right.append(current_stroke_right)
-                current_stroke_right = []
-                drawing_right = False
+            elif drawing:
+                if len(current_stroke) > 1:
+                    drawn_lines.append(current_stroke)
+                current_stroke = []
+                drawing = False
 
     if running_sim:
-        # Check if any ball is held, and only simulate if none are held
         if held_ball_left == -1 and held_ball_right == -1:
-            simulate_balls(balls_with_friction, drawn_lines_left, apply_friction=True, screen_offset=0)
-            simulate_balls(balls_without_friction, drawn_lines_right, apply_friction=False, screen_offset=SCREEN_WIDTH)
+            simulate_balls(balls_with_friction, drawn_lines, apply_friction=True, screen_offset=0)
+            simulate_balls(balls_without_friction, drawn_lines, apply_friction=False, screen_offset=SCREEN_WIDTH)
 
     # Drawing -------------------------------------------------------
     screen.fill((255, 255, 255))
@@ -622,18 +682,30 @@ while running:
     draw_wind_button(wind_down_rect.x, wind_down_rect.y, "Down", current_wind == WindDirection.DOWN)
 
     # Draw left screen strokes
-    for stroke in drawn_lines_left:
+    for stroke in drawn_lines:
         if len(stroke) > 1:
-            pygame.draw.lines(screen, (0, 0, 0), False, stroke, PEN_WIDTH)
-    if drawing_left and len(current_stroke_left) > 1:
-        pygame.draw.lines(screen, (100, 100, 100), False, current_stroke_left, PEN_WIDTH)
+            # Convert normalized coordinates to left screen absolute coordinates
+            absolute_stroke_left = [(x * SCREEN_WIDTH, y * HEIGHT) for x, y in stroke]
+            pygame.draw.lines(screen, (0, 0, 0), False, absolute_stroke_left, PEN_WIDTH)
+    if drawing and len(current_stroke) > 1:
+        # Draw current stroke being drawn
+        mouse_x = mouse_pos[0]
+        if mouse_x < SCREEN_WIDTH:  # Drawing on left screen
+            absolute_current = [(x * SCREEN_WIDTH, y * HEIGHT) for x, y in current_stroke]
+            pygame.draw.lines(screen, (100, 100, 100), False, absolute_current, PEN_WIDTH)
 
     # Draw right screen strokes
-    for stroke in drawn_lines_right:
+    for stroke in drawn_lines:
         if len(stroke) > 1:
-            pygame.draw.lines(screen, (0, 0, 0), False, stroke, PEN_WIDTH)
-    if drawing_right and len(current_stroke_right) > 1:
-        pygame.draw.lines(screen, (100, 100, 100), False, current_stroke_right, PEN_WIDTH)
+            # Convert normalized coordinates to right screen absolute coordinates
+            absolute_stroke_right = [(x * SCREEN_WIDTH + SCREEN_WIDTH, y * HEIGHT) for x, y in stroke]
+            pygame.draw.lines(screen, (0, 0, 0), False, absolute_stroke_right, PEN_WIDTH)
+    if drawing and len(current_stroke) > 1:
+        # Draw current stroke being drawn
+        mouse_x = mouse_pos[0]
+        if mouse_x >= SCREEN_WIDTH:  # Drawing on right screen
+            absolute_current = [(x * SCREEN_WIDTH + SCREEN_WIDTH, y * HEIGHT) for x, y in current_stroke]
+            pygame.draw.lines(screen, (100, 100, 100), False, absolute_current, PEN_WIDTH)
 
     # Draw balls
     draw_balls(balls_with_friction, screen_offset=0)
