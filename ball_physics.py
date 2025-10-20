@@ -21,9 +21,7 @@ C_SCALE = min(SCREEN_WIDTH, HEIGHT) / SIM_MIN_WIDTH
 SIM_WIDTH = SCREEN_WIDTH / C_SCALE
 SIM_HEIGHT = HEIGHT / C_SCALE
 
-
 def inv_cY(y): return (HEIGHT - y) / C_SCALE
-
 
 # Wind Direction Enum ----------------------------------------------
 class WindDirection(Enum):
@@ -45,7 +43,6 @@ current_wind = WindDirection.NONE
 # We use the squared value to avoid costly square root operations
 SLEEP_VELOCITY_SQ = 0.01 * 0.01
 
-
 # Ball Constants (UPDATED with variable Radius) --------------------
 # Mass range
 BALL_MIN_MASS = 1.0
@@ -60,7 +57,6 @@ BALL_MIN_POS = {'x': 0.2, 'y': 0.2}
 BALL_MAX_POS = {'x': 1.0, 'y': 2.0}
 BALL_MIN_VEL = {'x': 6.0, 'y': 10.0}
 BALL_MAX_VEL = {'x': 12.0, 'y': 18.0}
-
 
 # Multiple balls ---------------------------------------------------
 def make_ball():
@@ -157,7 +153,6 @@ def draw_wind_button(x, y, text, is_active):
     screen.blit(txt, (x + (SMALL_BUTTON_WIDTH - txt.get_width()) // 2,
                       y + (30 - txt.get_height()) // 2))
 
-
 start_button_rect = pygame.Rect(20, 20, BUTTON_WIDTH, BUTTON_HEIGHT)
 pause_button_rect = pygame.Rect(140, 20, BUTTON_WIDTH, BUTTON_HEIGHT)
 add_ball_button_rect = pygame.Rect(260, 20, BUTTON_WIDTH + 20, BUTTON_HEIGHT)
@@ -181,7 +176,6 @@ last_ball_x = 0.0
 last_ball_y = 0.0
 last_update_time = 0.0
 
-
 # Helper for Ball Grab ----------------------------------------
 def check_ball_click(pos_x, pos_y, balls, screen_offset=0):
     """Checks if mouse is over a ball and returns the ball index if true."""
@@ -200,7 +194,6 @@ def check_ball_click(pos_x, pos_y, balls, screen_offset=0):
             return i
     return -1
 
-
 # Helper ------------------------------------------------------------
 def reflect_velocity(vel, normal):
     # CORRECTION: Apply COR (e.g., 0.8) for better realism and energy loss
@@ -214,7 +207,6 @@ def reflect_velocity(vel, normal):
     vel['x'] += impulse_magnitude * normal[0]
     vel['y'] += impulse_magnitude * normal[1]
 
-
 # Collision detection with line segments ---------------------------
 def point_to_segment_distance(px, py, x1, y1, x2, y2):
     """Returns the shortest distance from point (px, py) to line segment (x1,y1)-(x2,y2)"""
@@ -227,7 +219,6 @@ def point_to_segment_distance(px, py, x1, y1, x2, y2):
     closest_x = x1 + t * dx
     closest_y = y1 + t * dy
     return math.sqrt((px - closest_x) ** 2 + (py - closest_y) ** 2), (closest_x, closest_y)
-
 
 def line_segment_intersection(x1, y1, x2, y2, x3, y3, x4, y4):
     """Check if line segments (x1,y1)-(x2,y2) and (x3,y3)-(x4,y4) intersect"""
@@ -243,7 +234,6 @@ def line_segment_intersection(x1, y1, x2, y2, x3, y3, x4, y4):
         iy = y1 + t * (y2 - y1)
         return True, ix, iy
     return False, None, None
-
 
 def check_line_collision_swept(old_pos, new_pos, ball_radius, stroke, screen_offset=0):
     """Check collision between ball trajectory and pen stroke using swept collision"""
@@ -337,7 +327,6 @@ def check_line_collision_swept(old_pos, new_pos, ball_radius, stroke, screen_off
                         collision_happened = True
 
     return collision_happened, best_normal, best_point, best_t
-
 
 # Simulation --------------------------------------------------------
 def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
@@ -458,7 +447,6 @@ def simulate_balls(balls, drawn_lines, apply_friction, screen_offset=0):
             ball['vel']['x'] = 0.0
             ball['vel']['y'] = 0.0
 
-
 def draw_balls(balls, screen_offset=0):
     """Draw balls with given screen offset - with fake 3D shading and holding highlight"""
     for i, ball in enumerate(balls):
@@ -516,7 +504,6 @@ def draw_balls(balls, screen_offset=0):
             ring_color = (255, 255, 255)
             for r_offset in range(2, 5):
                 pygame.gfxdraw.aacircle(screen, int(px), int(py), pr + r_offset, ring_color)
-
 
 # Main loop --------------------------------------------------------
 running = True
